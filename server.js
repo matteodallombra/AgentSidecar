@@ -1,6 +1,6 @@
 import http from "node:http";
 import { spawn, execFile } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFile, writeFile, mkdir, stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import path from "node:path";
@@ -101,6 +101,7 @@ async function readQueuedFollowUps() {
           .map((entry) => ({
             id: String(entry.id || hash(JSON.stringify(entry))),
             text: String(entry.text || entry.context?.prompt || ""),
+            imageAttachments: Array.isArray(entry.context?.imageAttachments) ? entry.context.imageAttachments : [],
             createdAt: Number(entry.createdAt || 0),
           }))
           .filter((entry) => entry.text.trim()),
@@ -122,6 +123,47 @@ async function removeQueuedFollowUp(threadId, followUpId) {
   if (raw[threadId].length === 0) delete raw[threadId];
   await writeFile(GLOBAL_STATE_FILE, JSON.stringify(parsed));
   return removed;
+}
+
+async function enqueueFollowUp(threadId, prompt, savedAttachments = []) {
+  const rows = await sqlite([`select id,cwd from threads where id = '${threadId.replaceAll("'", "''")}' limit 1`]);
+  if (!rows[0]) throw new Error("Thread not found");
+
+  let parsed = {};
+  try {
+    parsed = JSON.parse(await readFile(GLOBAL_STATE_FILE, "utf8"));
+  } catch {}
+
+  const queued = parsed["queued-follow-ups"] && typeof parsed["queued-follow-ups"] === "object" ? parsed["queued-follow-ups"] : {};
+  const cwd = rows[0].cwd || process.cwd();
+  queued[threadId] = Array.isArray(queued[threadId]) ? queued[threadId] : [];
+  queued[threadId].push({
+    id: randomUUID(),
+    text: prompt,
+    context: {
+      addedFiles: [],
+      prompt,
+      ideContext: null,
+      imageAttachments: savedAttachments.map((attachment) => ({
+        id: randomUUID(),
+        src: `data:${attachment.mimeType};base64,${attachment.dataBase64}`,
+        localPath: attachment.filePath,
+        filename: attachment.filename,
+        uploadStatus: "idle",
+      })),
+      nativeAppContexts: [],
+      fileAttachments: [],
+      inAppBrowserContext: null,
+      commentAttachments: [],
+      selectedTextAttachments: [],
+      pullRequestChecks: [],
+      workspaceRoots: [cwd],
+    },
+    cwd,
+    createdAt: Date.now(),
+  });
+  parsed["queued-follow-ups"] = queued;
+  await writeFile(GLOBAL_STATE_FILE, JSON.stringify(parsed));
 }
 
 async function readCustomThreadTitles() {
@@ -353,7 +395,8 @@ function hash(value) {
   return createHash("sha1").update(value).digest("hex").slice(0, 16);
 }
 
-async function startRun(threadId, prompt) {
+async function startRun(threadId, prompt, savedAttachments = []) {
+  if (savedAttachments.length > 0) return startQueuedFollowUpRun(threadId, prompt, savedAttachments);
   if (SEND_MODE === "desktop-ui") return startDesktopUiRun(threadId, prompt);
   return startCliRun(threadId, prompt);
 }
@@ -361,14 +404,14 @@ async function startRun(threadId, prompt) {
 async function buildPromptWithAttachments(threadId, prompt, attachments) {
   const trimmed = typeof prompt === "string" ? prompt.trim() : "";
   const saved = await saveAttachments(threadId, attachments);
-  if (!saved.length) return trimmed;
+  if (!saved.length) return { prompt: trimmed, savedAttachments: [] };
 
   const base = trimmed || "Please review the attached image(s).";
   const lines = saved.flatMap((attachment, index) => [
     `Image ${index + 1}: ${attachment.filename}`,
     `![${attachment.filename}](${attachment.filePath})`,
   ]);
-  return `${base}\n\nAttached images:\n${lines.join("\n")}`;
+  return { prompt: `${base}\n\nAttached images:\n${lines.join("\n")}`, savedAttachments: saved };
 }
 
 async function saveAttachments(threadId, attachments) {
@@ -394,7 +437,7 @@ async function saveAttachments(threadId, attachments) {
     const filename = `${Date.now()}-${index + 1}-${baseName}${ext}`;
     const filePath = path.join(threadDir, filename);
     await writeFile(filePath, buffer, { mode: 0o600 });
-    saved.push({ filename, filePath, mimeType, size: buffer.length });
+    saved.push({ filename, filePath, mimeType, size: buffer.length, dataBase64: buffer.toString("base64") });
   }
   return saved;
 }
@@ -414,6 +457,30 @@ function sanitizePathSegment(value) {
 function sanitizeFilename(value) {
   const filename = path.basename(String(value)).replace(/[^a-zA-Z0-9._-]/g, "_");
   return filename.slice(0, 120) || "image";
+}
+
+async function startQueuedFollowUpRun(threadId, prompt, savedAttachments = []) {
+  const id = randomBytes(10).toString("hex");
+  const run = { id, threadId, status: "running", mode: "queued-follow-up", lines: [], startedAt: Date.now(), finishedAt: null, exitCode: null };
+  runs.set(id, run);
+  console.log(`[${new Date().toISOString()}] run ${id} queued-follow-up submit thread=${threadId} chars=${prompt.length} attachments=${savedAttachments.length}`);
+  try {
+    await enqueueFollowUp(threadId, prompt, savedAttachments);
+    run.status = "complete";
+    run.exitCode = 0;
+    run.lines.push({
+      at: new Date().toISOString(),
+      type: "stdout",
+      text: savedAttachments.length > 0 ? "Added to the Codex desktop follow-up queue with image attachments." : "Added to the Codex desktop follow-up queue.",
+      parsed: null,
+    });
+  } catch (error) {
+    run.status = "failed";
+    run.exitCode = 1;
+    run.lines.push({ at: new Date().toISOString(), type: "error", text: error.message });
+  }
+  run.finishedAt = Date.now();
+  return run;
 }
 
 async function startDesktopUiRun(threadId, prompt) {
@@ -483,15 +550,33 @@ end run
               parsed: null,
             });
           } else {
-            console.log(`[${new Date().toISOString()}] run ${id} was not found in the Codex transcript`);
-            run.status = "failed";
-            run.exitCode = 1;
-            run.lines.push({
-              at: new Date().toISOString(),
-              type: "error",
-              text:
-                "The prompt reached the Mac bridge, but Codex did not record it after the desktop paste/submit step. Make sure the target Codex chat is visible and its composer can accept keyboard input.",
-            });
+            console.log(`[${new Date().toISOString()}] run ${id} was not found in the Codex transcript; queueing follow-up fallback`);
+            enqueueFollowUp(threadId, prompt)
+              .then(() => {
+                run.status = "complete";
+                run.exitCode = 0;
+                run.lines.push({
+                  at: new Date().toISOString(),
+                  type: "stdout",
+                  text: "The desktop paste was not confirmed, so AgentSidecar added the prompt to the Codex follow-up queue.",
+                  parsed: null,
+                });
+              })
+              .catch((error) => {
+                run.status = "failed";
+                run.exitCode = 1;
+                run.lines.push({
+                  at: new Date().toISOString(),
+                  type: "error",
+                  text:
+                    "The prompt reached the Mac bridge, but Codex did not record it after the desktop paste/submit step. Make sure the target Codex chat is visible and its composer can accept keyboard input.",
+                });
+                run.lines.push({ at: new Date().toISOString(), type: "error", text: error.message });
+              })
+              .finally(() => {
+                run.finishedAt = Date.now();
+              });
+            return;
           }
           run.finishedAt = Date.now();
         });
@@ -641,9 +726,9 @@ async function handleApi(req, res) {
     const attachments = Array.isArray(body.attachments) ? body.attachments : [];
     if (typeof body.prompt !== "string") return sendJson(res, 400, { error: "Prompt is required." });
     if (!body.prompt.trim() && attachments.length === 0) return sendJson(res, 400, { error: "Prompt or image attachment is required." });
-    const prompt = await buildPromptWithAttachments(resumeMatch[1], body.prompt, attachments);
-    logRequest(req, `resume thread=${resumeMatch[1]} chars=${prompt.length} attachments=${attachments.length}`);
-    const run = await startRun(resumeMatch[1], prompt);
+    const { prompt, savedAttachments } = await buildPromptWithAttachments(resumeMatch[1], body.prompt, attachments);
+    logRequest(req, `resume thread=${resumeMatch[1]} chars=${prompt.length} attachments=${savedAttachments.length}`);
+    const run = await startRun(resumeMatch[1], prompt, savedAttachments);
     sendJson(res, 202, { runId: run.id });
     return;
   }
