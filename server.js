@@ -399,9 +399,9 @@ async function startRun(threadId, prompt, savedAttachments = []) {
   if (SEND_MODE === "desktop-ui") {
     const active = await isThreadActive(threadId);
     console.log(
-      `[${new Date().toISOString()}] route thread=${threadId} active=${active} mode=${active ? "queued-follow-up" : "desktop-ui"}`,
+      `[${new Date().toISOString()}] route thread=${threadId} active=${active} mode=desktop-ui`,
     );
-    return active ? startQueuedFollowUpRun(threadId, prompt, savedAttachments) : startDesktopUiRun(threadId, prompt);
+    return startDesktopUiRun(threadId, prompt);
   }
   return startCliRun(threadId, prompt);
 }
