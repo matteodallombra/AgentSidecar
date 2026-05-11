@@ -22,6 +22,8 @@ const GLOBAL_STATE_FILE = path.join(CODEX_HOME, ".codex-global-state.json");
 const SESSION_INDEX_FILE = path.join(CODEX_HOME, "session_index.jsonl");
 const PAIRING_QR_FILE = path.join(APP_DIR, "pairing-qr.png");
 const SEND_MODE = process.env.CODEX_LAN_SEND_MODE || "desktop-ui";
+const APP_SERVER_PORT = Number(process.env.CODEX_LAN_APP_SERVER_PORT || 18789);
+const APP_SERVER_URL = process.env.CODEX_LAN_APP_SERVER_URL || `ws://127.0.0.1:${APP_SERVER_PORT}`;
 
 const mime = {
   ".html": "text/html; charset=utf-8",
@@ -33,6 +35,7 @@ const mime = {
 };
 
 const runs = new Map();
+let appServerClientPromise = null;
 
 await mkdir(APP_DIR, { recursive: true });
 await mkdir(ATTACHMENTS_DIR, { recursive: true });
@@ -573,6 +576,9 @@ function hash(value) {
 }
 
 async function startRun(threadId, prompt, savedAttachments = []) {
+  if (SEND_MODE === "app-server") {
+    return startAppServerRun(threadId, prompt, savedAttachments);
+  }
   if (SEND_MODE === "desktop-ui") {
     const active = await isThreadActive(threadId);
     console.log(
@@ -583,6 +589,288 @@ async function startRun(threadId, prompt, savedAttachments = []) {
     return startDesktopUiRun(threadId, prompt, savedAttachments);
   }
   return startCliRun(threadId, prompt);
+}
+
+async function startAppServerRun(threadId, prompt, savedAttachments = []) {
+  const rows = await sqlite([`select id,cwd from threads where id = '${threadId.replaceAll("'", "''")}' limit 1`]);
+  if (!rows[0]) throw new Error("Thread not found");
+
+  const id = randomBytes(10).toString("hex");
+  const run = {
+    id,
+    threadId,
+    status: "running",
+    mode: "app-server",
+    lines: [],
+    startedAt: Date.now(),
+    finishedAt: null,
+    exitCode: null,
+    appServerAgentMessage: "",
+    appServerReasoning: "",
+  };
+  runs.set(id, run);
+  console.log(`[${new Date().toISOString()}] run ${id} app-server submit thread=${threadId} chars=${prompt.length} attachments=${savedAttachments.length}`);
+
+  (async () => {
+    try {
+      const client = await getAppServerClient();
+      const resume = await client.request("thread/resume", {
+        threadId,
+        excludeTurns: true,
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+      });
+      const activeTurnId = await findActiveTurnId(client, threadId);
+      const input = appServerInput(prompt, savedAttachments);
+      let response;
+      if (activeTurnId) {
+        response = await client.request("turn/steer", { threadId, expectedTurnId: activeTurnId, input });
+        run.lines.push({
+          at: new Date().toISOString(),
+          type: "stdout",
+          text: "Steered the active Codex app-server turn.",
+          parsed: null,
+        });
+      } else {
+        response = await client.request("turn/start", {
+          threadId,
+          input,
+          cwd: rows[0].cwd || resume.cwd || undefined,
+          approvalPolicy: "never",
+          sandboxPolicy: { type: "dangerFullAccess" },
+        });
+        run.appServerTurnId = response?.turn?.id || null;
+        run.lines.push({
+          at: new Date().toISOString(),
+          type: "stdout",
+          text: "Started a Codex app-server turn.",
+          parsed: null,
+        });
+      }
+      if (response?.turn?.id) run.appServerTurnId = response.turn.id;
+      await waitForAppServerTurn(client, run, threadId, run.appServerTurnId, 45 * 60 * 1000);
+      if (run.status === "running") {
+        run.status = "complete";
+        run.exitCode = 0;
+      }
+    } catch (error) {
+      console.log(`[${new Date().toISOString()}] run ${id} app-server failed: ${error.message}`);
+      run.status = "failed";
+      run.exitCode = 1;
+      run.lines.push({ at: new Date().toISOString(), type: "error", text: error.message });
+      appServerClientPromise = null;
+    } finally {
+      run.finishedAt = Date.now();
+    }
+  })();
+
+  return run;
+}
+
+function appServerInput(prompt, savedAttachments) {
+  const input = [{ type: "text", text: prompt, text_elements: [] }];
+  for (const attachment of savedAttachments) {
+    input.push({ type: "localImage", path: attachment.filePath });
+  }
+  return input;
+}
+
+async function findActiveTurnId(client, threadId) {
+  try {
+    const turns = await client.request("thread/turns/list", { threadId, limit: 10, sortDirection: "desc" });
+    return turns?.data?.find((turn) => turn.status === "inProgress")?.id || null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForAppServerTurn(client, run, threadId, turnId, timeoutMs) {
+  if (!turnId) return;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && run.status === "running") {
+    const event = await client.nextNotification((message) => {
+      if (message.params?.threadId !== threadId) return false;
+      const eventTurnId = message.params?.turnId || message.params?.turn?.id;
+      return !eventTurnId || eventTurnId === turnId;
+    }, 30_000);
+    if (!event) continue;
+    handleAppServerNotification(run, event);
+    if (event.method === "turn/completed") return;
+  }
+}
+
+function handleAppServerNotification(run, message) {
+  const params = message.params || {};
+  if (message.method === "item/agentMessage/delta" && params.delta) {
+    run.appServerAgentMessage += params.delta;
+  } else if ((message.method === "item/reasoning/textDelta" || message.method === "item/reasoning/summaryTextDelta") && params.delta) {
+    run.appServerReasoning += params.delta;
+  } else if (message.method === "turn/completed") {
+    const turn = params.turn || {};
+    if (run.appServerReasoning) {
+      run.lines.push({
+        at: new Date().toISOString(),
+        type: "stdout",
+        text: JSON.stringify({ payload: { type: "reasoning", message: run.appServerReasoning } }),
+        parsed: { payload: { type: "reasoning", message: run.appServerReasoning } },
+      });
+    }
+    if (run.appServerAgentMessage) {
+      run.lines.push({
+        at: new Date().toISOString(),
+        type: "stdout",
+        text: JSON.stringify({ payload: { type: "agent_message", message: run.appServerAgentMessage } }),
+        parsed: { payload: { type: "agent_message", message: run.appServerAgentMessage } },
+      });
+    }
+    run.status = turn.status === "failed" ? "failed" : "complete";
+    run.exitCode = turn.status === "failed" ? 1 : 0;
+    if (turn.error?.message) {
+      run.lines.push({ at: new Date().toISOString(), type: "error", text: turn.error.message, parsed: null });
+    }
+  } else if (message.method === "thread/status/changed") {
+    run.lines.push({
+      at: new Date().toISOString(),
+      type: "stdout",
+      text: `Codex app-server status: ${JSON.stringify(params.status)}`,
+      parsed: null,
+    });
+  }
+  if (run.lines.length > 1000) run.lines.splice(0, run.lines.length - 1000);
+}
+
+async function getAppServerClient() {
+  if (!appServerClientPromise) appServerClientPromise = createAppServerClient();
+  return appServerClientPromise;
+}
+
+async function createAppServerClient() {
+  const started = await ensureAppServer();
+  const ws = new WebSocket(APP_SERVER_URL);
+  const pending = new Map();
+  const notifications = [];
+  const waiters = [];
+  let nextId = 1;
+
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Timed out connecting to Codex app-server.")), 10_000);
+    ws.onopen = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    ws.onerror = () => reject(new Error("Could not connect to Codex app-server."));
+  });
+
+  ws.onmessage = (event) => {
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (message.id != null && pending.has(message.id)) {
+      const { resolve, reject } = pending.get(message.id);
+      pending.delete(message.id);
+      if (message.error) reject(new Error(message.error.message || "Codex app-server request failed."));
+      else resolve(message.result);
+      return;
+    }
+    let delivered = false;
+    for (const waiter of waiters.splice(0)) {
+      if (waiter.filter(message)) {
+        clearTimeout(waiter.timer);
+        waiter.resolve(message);
+        delivered = true;
+      } else {
+        waiters.push(waiter);
+      }
+    }
+    if (!delivered) {
+      notifications.push(message);
+      if (notifications.length > 500) notifications.shift();
+    }
+  };
+
+  ws.onclose = () => {
+    appServerClientPromise = null;
+    for (const { reject } of pending.values()) reject(new Error("Codex app-server disconnected."));
+    pending.clear();
+  };
+
+  const client = {
+    started,
+    request(method, params) {
+      const id = nextId++;
+      ws.send(JSON.stringify({ id, method, params }));
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        setTimeout(() => {
+          if (!pending.has(id)) return;
+          pending.delete(id);
+          reject(new Error(`Timed out waiting for app-server ${method}.`));
+        }, 30_000);
+      });
+    },
+    notify(method, params) {
+      ws.send(JSON.stringify({ method, params }));
+    },
+    nextNotification(filter, timeoutMs) {
+      const existingIndex = notifications.findIndex(filter);
+      if (existingIndex >= 0) {
+        const [message] = notifications.splice(existingIndex, 1);
+        return Promise.resolve(message);
+      }
+      return new Promise((resolve) => {
+        const waiter = {
+          filter,
+          resolve,
+          timer: setTimeout(() => {
+            const index = waiters.indexOf(waiter);
+            if (index >= 0) waiters.splice(index, 1);
+            resolve(null);
+          }, timeoutMs),
+        };
+        waiters.push(waiter);
+      });
+    },
+  };
+
+  await client.request("initialize", {
+    clientInfo: { name: "agentsidecar", title: "AgentSidecar", version: "0.1.0" },
+    capabilities: { experimentalApi: true },
+  });
+  client.notify("initialized");
+  return client;
+}
+
+async function ensureAppServer() {
+  try {
+    const response = await fetch(APP_SERVER_URL.replace(/^ws/, "http").replace(/\/$/, "") + "/readyz");
+    if (response.ok) return false;
+  } catch {}
+
+  const url = new URL(APP_SERVER_URL);
+  if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost") {
+    throw new Error(`Codex app-server is not running at ${APP_SERVER_URL}.`);
+  }
+
+  const child = spawn("codex", ["app-server", "--listen", APP_SERVER_URL], { stdio: ["ignore", "ignore", "pipe"] });
+  child.stderr.on("data", (chunk) => {
+    for (const line of chunk.toString("utf8").split("\n")) {
+      if (line.trim()) console.log(`[codex app-server] ${line}`);
+    }
+  });
+  child.unref();
+
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(APP_SERVER_URL.replace(/^ws/, "http").replace(/\/$/, "") + "/readyz");
+      if (response.ok) return true;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error("Timed out starting Codex app-server.");
 }
 
 async function isThreadActive(threadId) {

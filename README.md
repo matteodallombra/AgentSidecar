@@ -55,3 +55,11 @@ CODEX_LAN_SEND_MODE=cli-resume npm start
 ```
 
 `cli-resume` writes to Codex saved history but does not make the current desktop renderer update inline.
+
+Experimental Codex app-server mode:
+
+```sh
+CODEX_LAN_SEND_MODE=app-server npm start
+```
+
+`app-server` starts or connects to the local experimental Codex app-server over WebSocket, resumes the selected thread, and sends through `turn/start` or `turn/steer` instead of pasting into the Desktop UI. This is intended to test operation while Codex is minimized or the Mac is locked. It is experimental and the protocol may change; if it misbehaves, switch back to `desktop-ui`.
