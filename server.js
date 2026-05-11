@@ -531,8 +531,9 @@ async function startRun(threadId, prompt, savedAttachments = []) {
     console.log(
       `[${new Date().toISOString()}] route thread=${threadId} active=${active} mode=desktop-ui`,
     );
+    // Keep mobile and Mac in one visible timeline: default app sends must never fork into a background CLI run.
     if (active) return startQueuedFollowUpRun(threadId, prompt, savedAttachments);
-    return startCliRun(threadId, prompt);
+    return startDesktopUiRun(threadId, prompt, savedAttachments);
   }
   return startCliRun(threadId, prompt);
 }
@@ -645,7 +646,7 @@ async function startQueuedFollowUpRun(threadId, prompt, savedAttachments = []) {
   return run;
 }
 
-async function startDesktopUiRun(threadId, prompt) {
+async function startDesktopUiRun(threadId, prompt, savedAttachments = []) {
   const rows = await sqlite([`select id,cwd from threads where id = '${threadId.replaceAll("'", "''")}' limit 1`]);
   if (!rows[0]) throw new Error("Thread not found");
   const id = randomBytes(10).toString("hex");
@@ -713,7 +714,7 @@ end run
             });
           } else {
             console.log(`[${new Date().toISOString()}] run ${id} was not found in the Codex transcript; queueing follow-up fallback`);
-            enqueueFollowUp(threadId, prompt)
+            enqueueFollowUp(threadId, prompt, savedAttachments)
               .then(() => {
                 run.status = "complete";
                 run.exitCode = 0;
