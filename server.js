@@ -396,8 +396,40 @@ function hash(value) {
 }
 
 async function startRun(threadId, prompt, savedAttachments = []) {
-  if (SEND_MODE === "desktop-ui") return startQueuedFollowUpRun(threadId, prompt, savedAttachments);
+  if (SEND_MODE === "desktop-ui") {
+    const active = await isThreadActive(threadId);
+    console.log(
+      `[${new Date().toISOString()}] route thread=${threadId} active=${active} mode=${active ? "queued-follow-up" : "cli-resume"}`,
+    );
+    return active ? startQueuedFollowUpRun(threadId, prompt, savedAttachments) : startCliRun(threadId, prompt);
+  }
   return startCliRun(threadId, prompt);
+}
+
+async function isThreadActive(threadId) {
+  const rows = await sqlite([`select rollout_path from threads where id = '${threadId.replaceAll("'", "''")}' limit 1`]);
+  const rolloutPath = rows[0]?.rollout_path;
+  if (!rolloutPath) return false;
+
+  try {
+    const raw = await readFile(rolloutPath, "utf8");
+    let latestTaskEvent = null;
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (obj.type !== "event_msg") continue;
+      const type = obj.payload?.type;
+      if (type === "task_started" || type === "task_complete") latestTaskEvent = type;
+    }
+    return latestTaskEvent === "task_started";
+  } catch {
+    return false;
+  }
 }
 
 async function buildPromptWithAttachments(threadId, prompt, attachments) {
