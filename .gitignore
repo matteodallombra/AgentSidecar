@@ -1,0 +1,13 @@
+node_modules/
+output/
+DerivedData/
+.DS_Store
+*.xcuserstate
+*.xcuserdata/
+xcuserdata/
+
+# Native app lives in the private AgentSidecar-iOS repository.
+AgentSidecar/
+AgentSidecar.xcodeproj/
+AppIcon.icon/
+project.yml
