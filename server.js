@@ -396,8 +396,7 @@ function hash(value) {
 }
 
 async function startRun(threadId, prompt, savedAttachments = []) {
-  if (savedAttachments.length > 0) return startQueuedFollowUpRun(threadId, prompt, savedAttachments);
-  if (SEND_MODE === "desktop-ui") return startDesktopUiRun(threadId, prompt);
+  if (SEND_MODE === "desktop-ui") return startQueuedFollowUpRun(threadId, prompt, savedAttachments);
   return startCliRun(threadId, prompt);
 }
 
