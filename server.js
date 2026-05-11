@@ -371,6 +371,7 @@ async function readTranscript(threadId) {
   };
   const raw = await readFile(thread.rollout_path, "utf8");
   const events = [];
+  let pendingFileChanges = [];
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
     let obj;
@@ -383,23 +384,35 @@ async function readTranscript(threadId) {
     if (obj.type === "response_item" && payload.type === "message") {
       const text = eventText(payload);
       if (text && payload.role !== "developer") {
-        events.push({ id: hash(line), at: obj.timestamp, kind: "message", role: payload.role, text, phase: payload.phase || "" });
+        const event = { id: hash(line), at: obj.timestamp, kind: "message", role: payload.role, text, phase: payload.phase || "" };
+        if (shouldAttachFileChanges(event) && pendingFileChanges.length) {
+          event.fileChanges = pendingFileChanges;
+          pendingFileChanges = [];
+        }
+        events.push(event);
       }
     } else if (obj.type === "response_item" && ["function_call", "custom_tool_call"].includes(payload.type)) {
       const text = summarizeToolCall(payload);
       if (text) events.push({ id: hash(line), at: obj.timestamp, kind: "event", role: "system", text, phase: "" });
     } else if (obj.type === "event_msg") {
       if (["agent_message", "user_message"].includes(payload.type)) {
-        events.push({
+        const event = {
           id: hash(line),
           at: obj.timestamp,
           kind: "message",
           role: payload.type === "user_message" ? "user" : "assistant",
           text: payload.message || "",
           phase: payload.phase || "",
-        });
+        };
+        if (shouldAttachFileChanges(event) && pendingFileChanges.length) {
+          event.fileChanges = pendingFileChanges;
+          pendingFileChanges = [];
+        }
+        events.push(event);
       } else if (["exec_command_begin", "exec_command_end", "patch_apply_end", "task_started", "task_complete"].includes(payload.type)) {
-        events.push({ id: hash(line), at: obj.timestamp, kind: "event", role: "system", text: summarizeEvent(payload), phase: "" });
+        const fileChanges = summarizeFileChanges(payload, thread.cwd);
+        if (fileChanges.length) pendingFileChanges = mergeFileChanges(pendingFileChanges, fileChanges);
+        events.push({ id: hash(line), at: obj.timestamp, kind: "event", role: "system", text: summarizeEvent(payload), phase: "", fileChanges });
       }
     }
   }
@@ -417,6 +430,58 @@ function compactDuplicateMessages(events) {
     out.push(event);
   }
   return out;
+}
+
+function shouldAttachFileChanges(event) {
+  return event.role === "assistant" && event.phase === "final_answer";
+}
+
+function summarizeFileChanges(payload, cwd) {
+  if (payload?.type !== "patch_apply_end" || payload.success === false || !payload.changes) return [];
+  return Object.entries(payload.changes).map(([filePath, change]) => {
+    const counts = countUnifiedDiff(change?.unified_diff || "");
+    return {
+      path: filePath,
+      displayPath: displayFilePath(filePath, cwd),
+      filename: path.basename(filePath),
+      status: change?.type || "update",
+      additions: counts.additions,
+      deletions: counts.deletions,
+    };
+  });
+}
+
+function countUnifiedDiff(diff) {
+  let additions = 0;
+  let deletions = 0;
+  for (const line of String(diff).split("\n")) {
+    if (line.startsWith("+++") || line.startsWith("---")) continue;
+    if (line.startsWith("+")) additions += 1;
+    else if (line.startsWith("-")) deletions += 1;
+  }
+  return { additions, deletions };
+}
+
+function displayFilePath(filePath, cwd) {
+  if (!cwd || !path.isAbsolute(filePath)) return filePath;
+  const relative = path.relative(cwd, filePath);
+  if (!relative.startsWith("..") && !path.isAbsolute(relative)) return relative || path.basename(filePath);
+  return filePath;
+}
+
+function mergeFileChanges(existing, incoming) {
+  const merged = new Map(existing.map((change) => [change.path, { ...change }]));
+  for (const change of incoming) {
+    const current = merged.get(change.path);
+    if (current) {
+      current.additions += change.additions;
+      current.deletions += change.deletions;
+      current.status = change.status;
+    } else {
+      merged.set(change.path, { ...change });
+    }
+  }
+  return Array.from(merged.values());
 }
 
 function summarizeEvent(payload) {
