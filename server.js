@@ -1,7 +1,7 @@
 import http from "node:http";
 import { spawn, execFile } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFile, writeFile, mkdir, stat } from "node:fs/promises";
+import { open, readFile, writeFile, mkdir, stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -197,12 +197,15 @@ async function readCustomThreadTitles() {
 }
 
 async function readLatestLimits() {
+  const transcriptLimits = await readLatestTranscriptLimits();
+  if (transcriptLimits) return transcriptLimits;
+
   const rows = await sqlite(
     [
       `select id,ts,feedback_log_body
        from logs
-       where feedback_log_body like '%"type":"codex.rate_limits"%'
-       order by id desc
+       where feedback_log_body like '%websocket event:%codex.rate_limits%'
+       order by ts desc, ts_nanos desc, id desc
        limit 50`,
     ],
     LOGS_DB,
@@ -231,6 +234,48 @@ async function readLatestLimits() {
   };
 }
 
+async function readLatestTranscriptLimits() {
+  const rows = await sqlite([`select rollout_path from threads where rollout_path is not null order by updated_at_ms desc, updated_at desc limit 20`]);
+  for (const row of rows) {
+    try {
+      const raw = await readFileTail(row.rollout_path, 2 * 1024 * 1024);
+      const lines = raw.split("\n").filter(Boolean).reverse();
+      for (const line of lines) {
+        let obj;
+        try {
+          obj = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const payload = obj.payload || {};
+        if (!payload.rate_limits) continue;
+        return {
+          updatedAt: obj.timestamp || new Date().toISOString(),
+          planType: payload.rate_limits.plan_type || null,
+          limits: {
+            fiveHour: normalizeLimitWindow(payload.rate_limits.primary),
+            weekly: normalizeLimitWindow(payload.rate_limits.secondary),
+          },
+        };
+      }
+    } catch {}
+  }
+  return null;
+}
+
+async function readFileTail(filePath, maxBytes) {
+  const handle = await open(filePath, "r");
+  try {
+    const { size } = await handle.stat();
+    const length = Math.min(size, maxBytes);
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, size - length);
+    return buffer.toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
 function parseCodexRateLimitEvent(message) {
   const marker = "websocket event: ";
   const start = message.indexOf(marker);
@@ -245,12 +290,14 @@ function parseCodexRateLimitEvent(message) {
 function normalizeLimitWindow(limit) {
   if (!limit || typeof limit !== "object") return null;
   const usedPercent = clampPercent(limit.used_percent);
+  const resetAtSeconds = Number(limit.reset_at || limit.resets_at || 0);
+  const resetAfterSeconds = Math.round(Number(limit.reset_after_seconds || Math.max(0, resetAtSeconds - Date.now() / 1000) || 0));
   return {
     usedPercent,
     remainingPercent: Math.max(0, 100 - usedPercent),
     windowMinutes: Number(limit.window_minutes || 0),
-    resetAt: limit.reset_at ? new Date(Number(limit.reset_at) * 1000).toISOString() : null,
-    resetAfterSeconds: Number(limit.reset_after_seconds || 0),
+    resetAt: resetAtSeconds ? new Date(resetAtSeconds * 1000).toISOString() : null,
+    resetAfterSeconds,
   };
 }
 
