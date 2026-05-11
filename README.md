@@ -17,6 +17,14 @@ npm start
 
 The bridge prints local setup URLs, a bearer token, and a pairing QR code. Keep the bridge running while using AgentSidecar on the same local network.
 
+If `npm start` says the bridge is already running on port `8787`, leave that existing bridge open and use:
+
+```text
+http://127.0.0.1:8787/pairing-qr.png
+```
+
+to show the QR code on the Mac.
+
 ## What It Does
 
 - reads Codex chats from `~/.codex/state_5.sqlite`

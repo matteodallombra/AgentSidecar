@@ -809,6 +809,15 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+server.on("error", (error) => {
+  if (error.code === "EADDRINUSE") {
+    printAlreadyRunningMessage();
+    process.exit(0);
+  }
+  console.error(error);
+  process.exit(1);
+});
+
 server.listen(PORT, HOST, () => {
   const addresses = Object.values(os.networkInterfaces()).flat().filter((n) => n && n.family === "IPv4" && !n.internal);
   const preferred = addresses.find((addr) => !addr.address.startsWith("169.254.")) || addresses[0];
@@ -825,6 +834,17 @@ server.listen(PORT, HOST, () => {
   }
   for (const addr of addresses) console.log(`Manual setup URL: http://${addr.address}:${PORT}`);
 });
+
+function printAlreadyRunningMessage() {
+  const addresses = Object.values(os.networkInterfaces()).flat().filter((n) => n && n.family === "IPv4" && !n.internal);
+  const preferred = addresses.find((addr) => !addr.address.startsWith("169.254.")) || addresses[0];
+  console.log(`AgentSidecar bridge is already running on port ${PORT}.`);
+  if (preferred) {
+    console.log(`Manual setup URL: http://${preferred.address}:${PORT}`);
+  }
+  console.log(`Pairing QR: http://127.0.0.1:${PORT}/pairing-qr.png`);
+  console.log("Keep the existing bridge running; you do not need to start another copy.");
+}
 
 async function writePairingQRCode(payload) {
   await QRCode.toFile(PAIRING_QR_FILE, payload, {
