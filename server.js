@@ -531,7 +531,8 @@ async function startRun(threadId, prompt, savedAttachments = []) {
     console.log(
       `[${new Date().toISOString()}] route thread=${threadId} active=${active} mode=desktop-ui`,
     );
-    return startDesktopUiRun(threadId, prompt);
+    if (active) return startQueuedFollowUpRun(threadId, prompt, savedAttachments);
+    return startCliRun(threadId, prompt);
   }
   return startCliRun(threadId, prompt);
 }
