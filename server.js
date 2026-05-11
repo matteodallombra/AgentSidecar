@@ -13,6 +13,7 @@ const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "0.0.0.0";
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const DB = path.join(CODEX_HOME, "state_5.sqlite");
+const LOGS_DB = path.join(CODEX_HOME, "logs_2.sqlite");
 const APP_DIR = path.join(CODEX_HOME, "lan-companion");
 const TOKEN_FILE = path.join(APP_DIR, "token");
 const PINS_FILE = path.join(APP_DIR, "pins.json");
@@ -37,9 +38,9 @@ await mkdir(APP_DIR, { recursive: true });
 await mkdir(ATTACHMENTS_DIR, { recursive: true });
 const token = await loadOrCreateToken();
 
-function sqlite(args) {
+function sqlite(args, db = DB) {
   return new Promise((resolve, reject) => {
-    execFile("sqlite3", ["-json", DB, ...args], { maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
+    execFile("sqlite3", ["-json", db, ...args], { maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         reject(new Error(stderr || err.message));
         return;
@@ -193,6 +194,70 @@ async function readCustomThreadTitles() {
   } catch {}
 
   return titles;
+}
+
+async function readLatestLimits() {
+  const rows = await sqlite(
+    [
+      `select id,ts,feedback_log_body
+       from logs
+       where feedback_log_body like '%"type":"codex.rate_limits"%'
+       order by id desc
+       limit 50`,
+    ],
+    LOGS_DB,
+  );
+
+  for (const row of rows) {
+    const event = parseCodexRateLimitEvent(row.feedback_log_body);
+    if (!event?.rate_limits) continue;
+    return {
+      updatedAt: new Date((Number(row.ts) || Date.now() / 1000) * 1000).toISOString(),
+      planType: event.plan_type || null,
+      limits: {
+        fiveHour: normalizeLimitWindow(event.rate_limits.primary),
+        weekly: normalizeLimitWindow(event.rate_limits.secondary),
+      },
+    };
+  }
+
+  return {
+    updatedAt: null,
+    planType: null,
+    limits: {
+      fiveHour: null,
+      weekly: null,
+    },
+  };
+}
+
+function parseCodexRateLimitEvent(message) {
+  const marker = "websocket event: ";
+  const start = message.indexOf(marker);
+  if (start < 0) return null;
+  try {
+    return JSON.parse(message.slice(start + marker.length));
+  } catch {
+    return null;
+  }
+}
+
+function normalizeLimitWindow(limit) {
+  if (!limit || typeof limit !== "object") return null;
+  const usedPercent = clampPercent(limit.used_percent);
+  return {
+    usedPercent,
+    remainingPercent: Math.max(0, 100 - usedPercent),
+    windowMinutes: Number(limit.window_minutes || 0),
+    resetAt: limit.reset_at ? new Date(Number(limit.reset_at) * 1000).toISOString() : null,
+    resetAfterSeconds: Number(limit.reset_after_seconds || 0),
+  };
+}
+
+function clampPercent(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(100, number));
 }
 
 async function writePins(pins) {
@@ -709,6 +774,11 @@ async function handleApi(req, res) {
       time: new Date().toISOString(),
       tokenSuffix: token.slice(-6),
     });
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/limits") {
+    logRequest(req, "limits");
+    sendJson(res, 200, await readLatestLimits());
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/bootstrap") {
