@@ -42,7 +42,7 @@ Default send mode:
 CODEX_LAN_SEND_MODE=hybrid npm start
 ```
 
-`hybrid` uses the Codex Desktop UI while the Mac session is unlocked, so the Mac app and iOS app stay visually in sync when the selected thread is open on the Mac. If the Mac is locked, it falls back to the experimental app-server path so the iOS app can still continue the same saved thread/context.
+`hybrid` uses the Codex Desktop UI while the Mac session is unlocked and the bridge is running in a foreground process with Accessibility permission, so the Mac app and iOS app stay visually in sync when the selected thread is open on the Mac. If the Mac is locked, or the bridge is running as the always-on LaunchAgent, it falls back to the experimental app-server path so the iOS app can still continue the same saved thread/context.
 
 Desktop UI mode:
 

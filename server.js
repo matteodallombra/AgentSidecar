@@ -613,9 +613,10 @@ async function startRun(threadId, prompt, savedAttachments = []) {
   if (SEND_MODE === "hybrid") {
     const active = await isThreadActive(threadId);
     const locked = await isMacScreenLocked();
-    const desktopReady = !active && !locked;
+    const desktopAutomationReady = !isLaunchAgentBridge();
+    const desktopReady = !active && !locked && desktopAutomationReady;
     console.log(
-      `[${new Date().toISOString()}] route thread=${threadId} active=${active} mode=hybrid locked=${locked} desktopReady=${desktopReady}`,
+      `[${new Date().toISOString()}] route thread=${threadId} active=${active} mode=hybrid locked=${locked} desktopAutomationReady=${desktopAutomationReady} desktopReady=${desktopReady}`,
     );
     if (active) return startQueuedFollowUpRun(threadId, prompt, savedAttachments);
     if (desktopReady) return startDesktopUiRun(threadId, prompt, savedAttachments);
@@ -641,6 +642,10 @@ async function startRun(threadId, prompt, savedAttachments = []) {
     return startDesktopUiRun(threadId, prompt, savedAttachments);
   }
   return startCliRun(threadId, prompt);
+}
+
+function isLaunchAgentBridge() {
+  return process.env.XPC_SERVICE_NAME === "com.matteodallombra.agentsidecar.bridge";
 }
 
 function isMacScreenLocked() {
