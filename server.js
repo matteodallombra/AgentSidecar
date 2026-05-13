@@ -6,6 +6,7 @@ import { createReadStream } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
+import readline from "node:readline";
 import QRCode from "qrcode";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -24,6 +25,9 @@ const PAIRING_QR_FILE = path.join(APP_DIR, "pairing-qr.png");
 const SEND_MODE = process.env.CODEX_LAN_SEND_MODE || "desktop-ui";
 const APP_SERVER_PORT = Number(process.env.CODEX_LAN_APP_SERVER_PORT || 18789);
 const APP_SERVER_URL = process.env.CODEX_LAN_APP_SERVER_URL || `ws://127.0.0.1:${APP_SERVER_PORT}`;
+const CODEX_BIN = process.env.CODEX_BIN || "/opt/homebrew/bin/codex";
+const MAX_TRANSCRIPT_EVENTS = Number(process.env.CODEX_LAN_MAX_TRANSCRIPT_EVENTS || 2000);
+const MAX_ROLLOUT_READ_BYTES = Number(process.env.CODEX_LAN_MAX_ROLLOUT_READ_BYTES || 64 * 1024 * 1024);
 
 const mime = {
   ".html": "text/html; charset=utf-8",
@@ -420,10 +424,9 @@ async function readTranscript(threadId) {
     pinned: pins.visible.has(rows[0].id),
     project: rows[0].cwd || "Unknown project",
   };
-  const raw = await readFile(thread.rollout_path, "utf8");
   const events = [];
   let pendingFileChanges = [];
-  for (const line of raw.split("\n")) {
+  for await (const line of readJsonlLines(thread.rollout_path)) {
     if (!line.trim()) continue;
     let obj;
     try {
@@ -440,11 +443,11 @@ async function readTranscript(threadId) {
           event.fileChanges = pendingFileChanges;
           pendingFileChanges = [];
         }
-        events.push(event);
+        appendTranscriptEvent(events, event);
       }
     } else if (obj.type === "response_item" && ["function_call", "custom_tool_call"].includes(payload.type)) {
       const text = summarizeToolCall(payload);
-      if (text) events.push({ id: hash(line), at: obj.timestamp, kind: "event", role: "system", text, phase: "" });
+      if (text) appendTranscriptEvent(events, { id: hash(line), at: obj.timestamp, kind: "event", role: "system", text, phase: "" });
     } else if (obj.type === "event_msg") {
       if (["agent_message", "user_message"].includes(payload.type)) {
         const event = {
@@ -459,16 +462,44 @@ async function readTranscript(threadId) {
           event.fileChanges = pendingFileChanges;
           pendingFileChanges = [];
         }
-        events.push(event);
+        appendTranscriptEvent(events, event);
       } else if (["exec_command_begin", "exec_command_end", "patch_apply_end", "task_started", "task_complete"].includes(payload.type)) {
         const fileChanges = summarizeFileChanges(payload, thread.cwd);
         if (fileChanges.length) pendingFileChanges = mergeFileChanges(pendingFileChanges, fileChanges);
-        events.push({ id: hash(line), at: obj.timestamp, kind: "event", role: "system", text: summarizeEvent(payload), phase: "", fileChanges });
+        appendTranscriptEvent(events, { id: hash(line), at: obj.timestamp, kind: "event", role: "system", text: summarizeEvent(payload), phase: "", fileChanges });
       }
     }
   }
   const queuedFollowUps = (await readQueuedFollowUps()).get(threadId) || [];
   return { thread, events: compactDuplicateMessages(events), queuedFollowUps };
+}
+
+async function* readJsonlLines(filePath) {
+  const info = await stat(filePath);
+  if (info.size > MAX_ROLLOUT_READ_BYTES) {
+    const start = Math.max(0, info.size - MAX_ROLLOUT_READ_BYTES);
+    const size = info.size - start;
+    const handle = await open(filePath, "r");
+    try {
+      const buffer = Buffer.alloc(size);
+      await handle.read(buffer, 0, size, start);
+      const lines = buffer.toString("utf8").split("\n");
+      if (start > 0) lines.shift();
+      for (const line of lines) yield line;
+    } finally {
+      await handle.close();
+    }
+    return;
+  }
+
+  const stream = createReadStream(filePath, { encoding: "utf8" });
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  for await (const line of rl) yield line;
+}
+
+function appendTranscriptEvent(events, event) {
+  events.push(event);
+  if (events.length > MAX_TRANSCRIPT_EVENTS) events.shift();
 }
 
 function compactDuplicateMessages(events) {
@@ -872,7 +903,13 @@ async function ensureAppServer() {
     throw new Error(`Codex app-server is not running at ${APP_SERVER_URL}.`);
   }
 
-  const child = spawn("codex", ["app-server", "--listen", APP_SERVER_URL], { stdio: ["ignore", "ignore", "pipe"] });
+  const child = spawn(CODEX_BIN, ["app-server", "--listen", APP_SERVER_URL], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: { ...process.env, PATH: `/opt/homebrew/bin:${process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin"}` },
+  });
+  child.on("error", (error) => {
+    console.log(`[codex app-server] failed to start ${CODEX_BIN}: ${error.message}`);
+  });
   child.stderr.on("data", (chunk) => {
     for (const line of chunk.toString("utf8").split("\n")) {
       if (line.trim()) console.log(`[codex app-server] ${line}`);
@@ -897,9 +934,8 @@ async function isThreadActive(threadId) {
   if (!rolloutPath) return false;
 
   try {
-    const raw = await readFile(rolloutPath, "utf8");
     let latestTaskEvent = null;
-    for (const line of raw.split("\n")) {
+    for await (const line of readJsonlLines(rolloutPath)) {
       if (!line.trim()) continue;
       let obj;
       try {
@@ -1256,7 +1292,25 @@ async function handleApi(req, res) {
   const runMatch = url.pathname.match(/^\/api\/runs\/([^/]+)$/);
   if (req.method === "GET" && runMatch) {
     const run = runs.get(runMatch[1]);
-    if (!run) return sendJson(res, 404, { error: "Run not found" });
+    if (!run) {
+      return sendJson(res, 200, {
+        id: runMatch[1],
+        threadId: "",
+        status: "complete",
+        mode: "unknown",
+        lines: [
+          {
+            at: new Date().toISOString(),
+            type: "stdout",
+            text: "The bridge restarted after this send. Refreshing the thread will show any recorded Codex activity.",
+            parsed: null,
+          },
+        ],
+        startedAt: Date.now(),
+        finishedAt: Date.now(),
+        exitCode: 0,
+      });
+    }
     sendJson(res, 200, run);
     return;
   }
