@@ -610,6 +610,17 @@ function hash(value) {
 }
 
 async function startRun(threadId, prompt, savedAttachments = []) {
+  if (SEND_MODE === "hybrid") {
+    const active = await isThreadActive(threadId);
+    const locked = await isMacScreenLocked();
+    const desktopReady = !active && !locked;
+    console.log(
+      `[${new Date().toISOString()}] route thread=${threadId} active=${active} mode=hybrid locked=${locked} desktopReady=${desktopReady}`,
+    );
+    if (active) return startQueuedFollowUpRun(threadId, prompt, savedAttachments);
+    if (desktopReady) return startDesktopUiRun(threadId, prompt, savedAttachments);
+    return startAppServerRun(threadId, prompt, savedAttachments);
+  }
   if (SEND_MODE === "app-server") {
     const appServerTurnId = appServerActiveTurns.get(threadId) || null;
     const active = appServerTurnId ? true : await isThreadActive(threadId);
@@ -630,6 +641,18 @@ async function startRun(threadId, prompt, savedAttachments = []) {
     return startDesktopUiRun(threadId, prompt, savedAttachments);
   }
   return startCliRun(threadId, prompt);
+}
+
+function isMacScreenLocked() {
+  return new Promise((resolve) => {
+    execFile("ioreg", ["-n", "Root", "-d1"], { timeout: 1500 }, (err, stdout) => {
+      if (err) {
+        resolve(true);
+        return;
+      }
+      resolve(/CGSSessionScreenIsLocked"\s*=\s*(Yes|1)/.test(stdout));
+    });
+  });
 }
 
 async function startAppServerRun(threadId, prompt, savedAttachments = [], expectedActiveTurnId = null) {

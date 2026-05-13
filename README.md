@@ -39,6 +39,14 @@ to show the QR code on the Mac.
 Default send mode:
 
 ```sh
+CODEX_LAN_SEND_MODE=hybrid npm start
+```
+
+`hybrid` uses the Codex Desktop UI while the Mac session is unlocked, so the Mac app and iOS app stay visually in sync when the selected thread is open on the Mac. If the Mac is locked, it falls back to the experimental app-server path so the iOS app can still continue the same saved thread/context.
+
+Desktop UI mode:
+
+```sh
 CODEX_LAN_SEND_MODE=desktop-ui npm start
 ```
 
