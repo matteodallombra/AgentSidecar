@@ -35,6 +35,7 @@ const mime = {
 };
 
 const runs = new Map();
+const appServerActiveTurns = new Map();
 let appServerClientPromise = null;
 
 await mkdir(APP_DIR, { recursive: true });
@@ -472,11 +473,13 @@ async function readTranscript(threadId) {
 
 function compactDuplicateMessages(events) {
   const out = [];
-  const seen = new Set();
   for (const event of events) {
-    const key = `${event.role}:${event.kind}:${event.text}`;
-    if (seen.has(key) && event.kind === "message") continue;
-    seen.add(key);
+    const previous = out[out.length - 1];
+    if (event.kind === "message" && previous?.kind === "message" && previous.role === event.role && previous.text === event.text) {
+      if (!previous.phase && event.phase) previous.phase = event.phase;
+      if (!previous.fileChanges?.length && event.fileChanges?.length) previous.fileChanges = event.fileChanges;
+      continue;
+    }
     out.push(event);
   }
   return out;
@@ -577,6 +580,13 @@ function hash(value) {
 
 async function startRun(threadId, prompt, savedAttachments = []) {
   if (SEND_MODE === "app-server") {
+    const appServerTurnId = appServerActiveTurns.get(threadId) || null;
+    const active = appServerTurnId ? true : await isThreadActive(threadId);
+    console.log(
+      `[${new Date().toISOString()}] route thread=${threadId} active=${active} mode=app-server appServerTurn=${appServerTurnId || "none"}`,
+    );
+    if (appServerTurnId) return startAppServerRun(threadId, prompt, savedAttachments, appServerTurnId);
+    if (active) return startQueuedFollowUpRun(threadId, prompt, savedAttachments);
     return startAppServerRun(threadId, prompt, savedAttachments);
   }
   if (SEND_MODE === "desktop-ui") {
@@ -591,7 +601,7 @@ async function startRun(threadId, prompt, savedAttachments = []) {
   return startCliRun(threadId, prompt);
 }
 
-async function startAppServerRun(threadId, prompt, savedAttachments = []) {
+async function startAppServerRun(threadId, prompt, savedAttachments = [], expectedActiveTurnId = null) {
   const rows = await sqlite([`select id,cwd from threads where id = '${threadId.replaceAll("'", "''")}' limit 1`]);
   if (!rows[0]) throw new Error("Thread not found");
 
@@ -620,10 +630,11 @@ async function startAppServerRun(threadId, prompt, savedAttachments = []) {
         approvalPolicy: "never",
         sandbox: "danger-full-access",
       });
-      const activeTurnId = await findActiveTurnId(client, threadId);
+      const activeTurnId = expectedActiveTurnId || (await findActiveTurnId(client, threadId));
       const input = appServerInput(prompt, savedAttachments);
       let response;
       if (activeTurnId) {
+        run.appServerTurnId = activeTurnId;
         response = await client.request("turn/steer", { threadId, expectedTurnId: activeTurnId, input });
         run.lines.push({
           at: new Date().toISOString(),
@@ -640,6 +651,7 @@ async function startAppServerRun(threadId, prompt, savedAttachments = []) {
           sandboxPolicy: { type: "dangerFullAccess" },
         });
         run.appServerTurnId = response?.turn?.id || null;
+        if (run.appServerTurnId) appServerActiveTurns.set(threadId, run.appServerTurnId);
         run.lines.push({
           at: new Date().toISOString(),
           type: "stdout",
@@ -647,7 +659,10 @@ async function startAppServerRun(threadId, prompt, savedAttachments = []) {
           parsed: null,
         });
       }
-      if (response?.turn?.id) run.appServerTurnId = response.turn.id;
+      if (response?.turn?.id) {
+        run.appServerTurnId = response.turn.id;
+        appServerActiveTurns.set(threadId, run.appServerTurnId);
+      }
       await waitForAppServerTurn(client, run, threadId, run.appServerTurnId, 45 * 60 * 1000);
       if (run.status === "running") {
         run.status = "complete";
@@ -660,6 +675,9 @@ async function startAppServerRun(threadId, prompt, savedAttachments = []) {
       run.lines.push({ at: new Date().toISOString(), type: "error", text: error.message });
       appServerClientPromise = null;
     } finally {
+      if (run.appServerTurnId && appServerActiveTurns.get(threadId) === run.appServerTurnId) {
+        appServerActiveTurns.delete(threadId);
+      }
       run.finishedAt = Date.now();
     }
   })();
